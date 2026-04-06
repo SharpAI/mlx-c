@@ -6,7 +6,28 @@
 #include "mlx/c/fast.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+#include "mlx/array.h"
 #include "mlx/fast.h"
+#include "mlx/core/moe_stream_op.h"
+#include "mlx/fast/turbo_quant.h"
+
+namespace mlx::core {
+void prefault(const array& a) {
+    if (!a.data_shared_ptr()) return;
+    const uint8_t* ptr = static_cast<const uint8_t*>(const_cast<allocator::Buffer&>(a.buffer()).raw_ptr());
+    if (!ptr) return;
+    
+    // volatile to prevent the compiler from optimizing the read away
+    volatile uint8_t tmp = 0;
+    size_t size = a.buffer_size();
+    
+    // Read one byte per 16KB page to trigger the OS page fault handler
+    // on the CPU, avoiding the 5-second GPU Watchdog timeout.
+    for (size_t i = 0; i < size; i += 16384) {
+        tmp += ptr[i];
+    }
+}
+}
 
 struct mlx_fast_cuda_kernel_config_cpp_ {
   std::vector<mlx::core::Shape> output_shapes;
@@ -630,4 +651,294 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
     return 1;
   }
   return 0;
+}
+
+#include <json.hpp>
+#include <fstream>
+#include <mutex>
+#include <unordered_map>
+#include "mlx/backend/metal/ssd_streamer.h"
+
+struct SSDStreamEntry {
+    std::shared_ptr<mlx::core::fast::SSDStreamer> streamer;
+    // Maps tensor_name -> (data_start_in_file, bytes_per_expert)
+    // Key MUST be tensor_name (not num_experts) because gate_proj/up_proj/down_proj
+    // all have E=256 in the same file and would collide if keyed by E.
+    std::unordered_map<std::string, std::pair<size_t, size_t>> tensor_offset_map;
+};
+
+static std::mutex streamer_cache_mutex;
+static std::unordered_map<std::string, SSDStreamEntry> streamer_cache;
+
+extern "C" int mlx_fast_streamed_gather_mm(
+    mlx_array* res,
+    const mlx_array x,
+    const mlx_array w_shape,
+    uint32_t active_expert,
+    const char* safetensors_path,
+    const char* tensor_name,
+    const mlx_stream s) {
+  try {
+    std::string path(safetensors_path);
+    std::string target_tensor(tensor_name);
+    std::shared_ptr<mlx::core::fast::SSDStreamer> streamer;
+    
+    // The expert index is provided directly now
+    
+    // We need the max possible expert index range → use w_shape dim 0
+    auto w_shape_arr = mlx_array_get_(w_shape);
+    size_t E = w_shape_arr.shape(0); // number of experts (e.g. 256)
+    
+    size_t data_start = 0;      // absolute byte offset in file to first expert's weight
+    size_t bytes_per_expert = 0; // size in bytes of one expert's weight matrix
+    
+    {
+        std::lock_guard<std::mutex> lock(streamer_cache_mutex);
+        auto it = streamer_cache.find(path);
+        if (it != streamer_cache.end()) {
+            streamer = it->second.streamer;
+            auto& tmap = it->second.tensor_offset_map;
+            auto tit = tmap.find(target_tensor);
+            if (tit != tmap.end()) {
+                data_start       = tit->second.first;
+                bytes_per_expert = tit->second.second;
+            }
+        }
+        
+        if (!streamer || bytes_per_expert == 0) {
+            bool has_tensor_offsets = (it != streamer_cache.end()) &&
+                                      (it->second.tensor_offset_map.count(target_tensor) > 0);
+            
+            if (has_tensor_offsets) {
+                auto& p = it->second.tensor_offset_map.at(target_tensor);
+                data_start = p.first;
+                bytes_per_expert = p.second;
+            } else {
+                // Parse safetensors JSON header to find expert tensor layout
+                std::ifstream in(path, std::ios::binary);
+                if (!in.is_open()) throw std::runtime_error("[SSD] Cannot open: " + path);
+                
+                uint64_t hlen = 0;
+                in.read(reinterpret_cast<char*>(&hlen), 8);
+                std::vector<char> hbuf(hlen);
+                in.read(hbuf.data(), hlen);
+                auto j = nlohmann::json::parse(hbuf.data(), hbuf.data() + hlen);
+                in.close();
+                
+                size_t data_section_start = 8 + hlen;
+                
+                for (auto& item : j.items()) {
+                    if (item.key() == target_tensor) {
+                        auto& v = item.value();
+                        auto offsets = v.at("data_offsets").get<std::vector<size_t>>();
+                        size_t tensor_data_start = data_section_start + offsets[0];
+                        size_t tensor_total_bytes = offsets[1] - offsets[0];
+                        bytes_per_expert = tensor_total_bytes / E;
+                        data_start = tensor_data_start;
+                        break;
+                    }
+                }
+                
+                if (bytes_per_expert == 0) {
+                    throw std::runtime_error("[SSD] Could not find tensor " + target_tensor + " in " + path);
+                }
+                
+                if (!streamer) {
+                    streamer = std::make_shared<mlx::core::fast::SSDStreamer>(path, bytes_per_expert);
+                    SSDStreamEntry entry;
+                    entry.streamer = streamer;
+                    entry.tensor_offset_map[target_tensor] = {data_start, bytes_per_expert};
+                    streamer_cache[path] = std::move(entry);
+                } else {
+                    streamer_cache[path].tensor_offset_map[target_tensor] = {data_start, bytes_per_expert};
+                }
+            }
+        }
+    }
+    
+    // Build per-expert absolute file offsets
+    std::vector<off_t> eo(E + 1);
+    for (size_t i = 0; i <= E; ++i) {
+        eo[i] = static_cast<off_t>(data_start + i * bytes_per_expert);
+    }
+
+    mlx_array_set_(
+        *res,
+        mlx::core::streamed_gather_mm(
+            mlx_array_get_(x),
+            mlx_array_get_(w_shape),
+            active_expert,
+            streamer,
+            eo,
+            mlx_stream_get_(s).device
+        ));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_fast_turbo_encode(
+    mlx_array* res_polar_k,
+    mlx_array* res_polar_v,
+    mlx_array* res_residual_k,
+    mlx_array* res_residual_v,
+    const mlx_array keys,
+    const mlx_array values,
+    int k_bits,
+    const mlx_stream s) {
+    try {
+        // Encode K: 3-bit PolarQuant + 1-bit QJL, packed into [.., 68] uint8
+        mlx_array_set_(
+            *res_polar_k,
+            mlx::core::fast::turbo_encode_k(
+                mlx_array_get_(keys),
+                mlx_stream_get_(s)));
+
+        // Encode V: 3-bit PolarQuant only, packed into [.., 50] uint8
+        mlx_array_set_(
+            *res_polar_v,
+            mlx::core::fast::turbo_encode_v(
+                mlx_array_get_(values),
+                mlx_stream_get_(s)));
+
+        // Metadata is packed inline — residual arrays are unused but must be
+        // valid (non-null ctx) so the Swift bridge can call mlx_array_free on them.
+        *res_residual_k = mlx_array_new();
+        *res_residual_v = mlx_array_new();
+    } catch (std::exception& e) {
+        mlx_error(e.what());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int mlx_fast_turbo_decode_k(
+    mlx_array* res,
+    const mlx_array packed,
+    const mlx_stream s) {
+    try {
+        mlx_array_set_(
+            *res,
+            mlx::core::fast::turbo_decode_k(
+                mlx_array_get_(packed),
+                mlx_stream_get_(s)));
+    } catch (std::exception& e) {
+        mlx_error(e.what());
+        return 1;
+    }
+    return 0;
+}
+
+extern "C" int mlx_fast_turbo_decode_v(
+    mlx_array* res,
+    const mlx_array packed,
+    const mlx_stream s) {
+    try {
+        mlx_array_set_(
+            *res,
+            mlx::core::fast::turbo_decode_v(
+                mlx_array_get_(packed),
+                mlx_stream_get_(s)));
+    } catch (std::exception& e) {
+        mlx_error(e.what());
+        return 1;
+    }
+    return 0;
+}
+
+
+extern "C" int mlx_fast_prefault(
+    mlx_array x) {
+
+    try {
+        mlx::core::prefault(mlx_array_get_(x));
+    } catch (std::exception& e) {
+        mlx_error(e.what());
+        return 1;
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mlx_fast_pread_into
+// Overwrite the data of an already-evaluated MLX array by pread()-ing
+// the matching expert slab directly from a .safetensors file.
+// This gives full NVMe sequential throughput (~5 GB/s) while preserving all
+// MLX tensor metadata (shape, strides, dtype) on the dst array.
+// ─────────────────────────────────────────────────────────────────────────────
+struct STPReadEntry {
+    int fd = -1;
+    size_t data_start = 0;
+    size_t bytes_per_expert = 0;
+};
+static std::mutex st_pread_cache_mutex;
+static std::unordered_map<std::string, STPReadEntry> st_pread_cache;
+
+extern "C" int mlx_fast_pread_into(
+    mlx_array dst,
+    const char* safetensors_path,
+    const char* tensor_name,
+    uint32_t expert_index) {
+    try {
+        std::string path(safetensors_path);
+        std::string tname(tensor_name);
+        std::string key = path + "|" + tname;
+
+        size_t data_start = 0;
+        size_t bytes_per_expert = 0;
+        int fd = -1;
+
+        {
+            std::lock_guard<std::mutex> lock(st_pread_cache_mutex);
+            auto it = st_pread_cache.find(key);
+            if (it != st_pread_cache.end()) {
+                fd = it->second.fd;
+                data_start = it->second.data_start;
+                bytes_per_expert = it->second.bytes_per_expert;
+            } else {
+                int new_fd = open(path.c_str(), O_RDONLY);
+                if (new_fd < 0) throw std::runtime_error("[pread_into] Cannot open: " + path);
+
+                uint64_t hlen = 0;
+                if (pread(new_fd, &hlen, 8, 0) != 8) { close(new_fd); throw std::runtime_error("[pread_into] Cannot read header length"); }
+                std::vector<char> hbuf(hlen);
+                if ((size_t)pread(new_fd, hbuf.data(), hlen, 8) != hlen) { close(new_fd); throw std::runtime_error("[pread_into] Cannot read header JSON"); }
+                auto j = nlohmann::json::parse(hbuf.data(), hbuf.data() + hlen);
+                size_t data_section_start = 8 + hlen;
+
+                for (auto& item : j.items()) {
+                    if (item.key() == tname) {
+                        auto& v = item.value();
+                        auto shape = v.at("shape").get<std::vector<size_t>>();
+                        auto offsets = v.at("data_offsets").get<std::vector<size_t>>();
+                        size_t E = shape[0];
+                        bytes_per_expert = (offsets[1] - offsets[0]) / E;
+                        data_start = data_section_start + offsets[0];
+                        break;
+                    }
+                }
+                if (bytes_per_expert == 0) { close(new_fd); throw std::runtime_error("[pread_into] Tensor not found: " + tname); }
+
+                STPReadEntry entry{ new_fd, data_start, bytes_per_expert };
+                st_pread_cache[key] = entry;
+                fd = new_fd;
+            }
+        }
+
+        auto& arr = mlx_array_get_(dst);
+        void* buf = const_cast<void*>(static_cast<const void*>(arr.data<uint8_t>()));
+        if (!buf) throw std::runtime_error("[pread_into] dst has no data pointer — call eval() first");
+        size_t nbytes = arr.nbytes();
+        off_t file_offset = static_cast<off_t>(data_start + (size_t)expert_index * bytes_per_expert);
+        ssize_t result = pread(fd, buf, nbytes, file_offset);
+        if (result < 0 || (size_t)result != nbytes)
+            throw std::runtime_error("[pread_into] pread failed: got " + std::to_string(result) + " of " + std::to_string(nbytes));
+
+    } catch (std::exception& e) {
+        mlx_error(e.what());
+        return 1;
+    }
+    return 0;
 }
