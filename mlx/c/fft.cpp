@@ -82,7 +82,6 @@ extern "C" int mlx_fft_fftshift(
         mlx::core::fft::fftshift(
             mlx_array_get_(a),
             std::vector<int>(axes, axes + axes_num),
-            mlx::core::fft::FFTNorm::Backward,
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
@@ -164,7 +163,6 @@ extern "C" int mlx_fft_ifftshift(
         mlx::core::fft::ifftshift(
             mlx_array_get_(a),
             std::vector<int>(axes, axes + axes_num),
-            mlx::core::fft::FFTNorm::Backward,
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
